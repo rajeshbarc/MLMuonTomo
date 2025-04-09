@@ -15,7 +15,7 @@ df = tree.arrays(library="pd")
 
 # Filter data
 dataFilter = df[['deviation', 'g4Momentum']].dropna()
-filtered_data = dataFilter[(dataFilter['deviation'] > 90e-3) & (dataFilter['g4Momentum'] !=0)]  # Assuming deviation in radians
+filtered_data = dataFilter[(dataFilter['deviation'] > 90e-3) & (dataFilter['g4Momentum'] !=0) & (dataFilter['g4Momentum'] <=9000)]  # Assuming deviation in radians
 
 # Prepare features and target
 X = filtered_data[['deviation']]  # Feature (scattering angle)
@@ -98,7 +98,7 @@ def polyLog():
     plt.show()
 
 def polyNatLog():
-    y_log = np.log(filtered_data['g4Momentum'])  
+    y_log = np.log(filtered_data['g4Momentum'])  # log(1 + x) for safety
     # Scale the data
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
@@ -162,9 +162,40 @@ def polyInv():
     plt.hist(y_pred_orig-y_test_orig, bins=200, alpha=0.7, color='orange')
     plt.show()
 
+def xgbLog():
+    import xgboost as xgb
+    y_log = np.log(filtered_data['g4Momentum'])  # log(1 + x) for safety
+    # Scale the data
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y_log.values.reshape(-1, 1))  # y or y_log can be changed here
+
+    # Split into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
+    )
+    model = xgb.XGBRegressor()
+    model.fit(X_train, y_train)
+    # Predict
+    y_pred_xgb_scaled = model.predict(X_test)
+    y_pred_xgb_orig = scaler_y.inverse_transform(y_pred_xgb_scaled.reshape(-1, 1))
+    y_pred_orig = np.exp(y_pred_xgb_orig)
+    y_test_orig = np.exp((scaler_y.inverse_transform(y_test.reshape(-1, 1))))
+    r2_pf = r2_score(y_test_orig, y_pred_orig)
+    mse_pf = mean_squared_error(y_pred_orig, y_test_orig)
+    std_pf = np.std(y_pred_orig - y_test_orig)
+    print("\n#### XGB Log Model: #####")
+    print(f"R^2 Score: {r2_pf}")
+    print(f"Mean Squared Error: {mse_pf} MeV²")
+    print(f"Standard Deviation of Residuals: {std_pf} MeV")
+    plt.hist(y_pred_orig - y_test_orig, bins=200, alpha=0.7, color='orange')
+    plt.show()
+
 
 if __name__=="__main__":
     rfLog()     #Random Forest Log Output
-    polyLog()   # Polynomial Log (1+x) Output
-    polyNatLog() # Polynomial Log natural Output
-    polyInv() # Polynomial Log natural Output inverted
+    polyLog()   # Polynomial Log Output
+    polyNatLog() # Polynomial Nat Log Output
+    polyInv()   #Polynomial inverse Log
+    xgbLog()    #xgBoost Log
