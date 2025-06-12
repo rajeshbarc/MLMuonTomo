@@ -60,7 +60,7 @@ processed_tTree = processed_file["tree"]
 test_df = pd.DataFrame(test_tTree.arrays(library="pd")).dropna()
 processed_df = pd.DataFrame(processed_tTree.arrays(library="pd")).dropna()
 
-# Filter data 
+# Filter data (same as your code for consistency)
 test_df = test_df[(test_df['angleDev'] > 30e-3)]
 processed_df = processed_df[(processed_df['angleDev'] > 30e-3)]
 
@@ -89,23 +89,39 @@ def compute_std_histogram(x, z, angle_dev, x_bins, z_bins):
     return std
 
 
-std_test = compute_std_histogram(x_test, z_test, angle_test, x_bins, z_bins)
-std_proc = compute_std_histogram(x_proc, z_proc, angle_proc, x_bins, z_bins)
+# Compute histograms for standard deviation
+def compute_std_histogramProc(x, z, angle_dev, x_bins, z_bins):
+    counts, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
+    sum_weights, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev)
+    sum_weights_squared, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev ** 2)
+    valid = counts > 100
+    mean = np.zeros_like(counts, dtype=float)
+    mean[valid] = sum_weights[valid] / counts[valid]
+    mean_squared = np.zeros_like(counts, dtype=float)
+    mean_squared[valid] = sum_weights_squared[valid] / counts[valid]
+    std = np.sqrt(np.abs(mean_squared - mean ** 2))
+    std[~valid] = np.nan
+    return std
 
-# Apply mask 
-threshold = np.nanmedian(std_test) * 0.5
+
+std_test = compute_std_histogram(x_test, z_test, angle_test, x_bins, z_bins)
+std_proc = compute_std_histogramProc(x_proc, z_proc, angle_proc, x_bins, z_bins)
+
+# Apply mask (std > 0.01)
+threshold = np.nanmedian(std_test) * 0.6
 mask_test = (std_test > threshold)
 mask_proc =  (std_proc > threshold)
 #mask = (std_test > 0.01) & (std_proc > 0.01)
 std_test_masked = np.where(mask_test, std_test, np.nan)
 std_proc_masked = np.where(mask_proc, std_proc, np.nan)
+std_test_maskedN = np.where(~mask_test, std_test, np.nan)
+std_proc_maskedN = np.where(~mask_proc, std_proc, np.nan)
 
 # Metric 1: Spatial Resolution (FWHM)
 fwhm_x_test = compute_fwhm(std_test_masked, x_bins, axis=0)
 fwhm_z_test = compute_fwhm(std_test_masked, z_bins, axis=1)
 fwhm_x_proc = compute_fwhm(std_proc_masked, x_bins, axis=0)
 fwhm_z_proc = compute_fwhm(std_proc_masked, z_bins, axis=1)
-
 
 # Metric 2: Contrast
 def compute_contrast(hist, mask):
@@ -116,9 +132,9 @@ def compute_contrast(hist, mask):
     return np.nan
 
 
+
 contrast_test = compute_contrast(std_test, mask_test)
 contrast_proc = compute_contrast(std_proc, mask_proc)
-
 
 # Metric 3: Uniformity
 def compute_uniformity(hist, mask):
