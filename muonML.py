@@ -1,201 +1,114 @@
-import numpy as np
 import uproot
 import pandas as pd
+import numpy as np
+import joblib
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
-
-# Load data from ROOT file
-file = uproot.open("MLData.root")  # Replace with your ROOT file path
-tree = file["mlData"]  # Replace with your TTree name if different
-df = tree.arrays(library="pd")
-
-# Filter data
-dataFilter = df[['deviation', 'g4Momentum']].dropna()
-filtered_data = dataFilter[(dataFilter['deviation'] > 90e-3) & (dataFilter['g4Momentum'] !=0) & (dataFilter['g4Momentum'] <=9000)]  # Assuming deviation in radians
-
-# Prepare features and target
-X = filtered_data[['deviation']]  # Feature (scattering angle)
-'''
-X = np.column_stack([
-    filtered_data['deviation'],
-    np.cos(filtered_data['deviation']),
-    np.sin(filtered_data['deviation'])
-])
-'''
-y = filtered_data['g4Momentum']   # Target (momentum in MeV)
-print(f"Mean of g4Momentum: {np.mean(y)} MeV")
-print(f"Std Deviation of g4Momentum{np.std(y)} Mev")
-print(f"Minimum of g4Momentum: {np.min(y)} and Maximum of g4Momentum: {np.max(y)} Mev")
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
 
 
-# --- Random Forest Model ---
-def rfLog():
-    y_log = np.log1p(filtered_data['g4Momentum'])  # log(1 + x) for safety
+# Step 1: Load test data from ROOT
+imgFile = uproot.open("test3.root")
+imgTree = imgFile['groundTruthPoCA']
+imgDF = imgTree.arrays(library='np')
 
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y_log.values.reshape(-1, 1))  # y or y_log can be changed here
+# Rename 'pocaX', 'pocaY', 'pocaZ' to 'objectX', etc.
+for i in ('X', 'Y', 'Z'):
+    imgDF['object' + i] = imgDF['poca' + i]
+    del imgDF['poca' + i]
 
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
-    )
-    rf_model = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42)
-    rf_model.fit(X_train, y_train.ravel())  # ravel() flattens y_train
+# Convert to DataFrame
+test_df = pd.DataFrame(imgDF)
+#test_df = test_df[test_df['angleDev']>30e-3]
 
-    y_pred_rf_scaled = rf_model.predict(X_test)
-    y_pred_rf_orig = scaler_y.inverse_transform(y_pred_rf_scaled.reshape(-1, 1))
-    y_pred_orig = np.expm1(y_pred_rf_orig)
-    y_test_orig = np.expm1(scaler_y.inverse_transform(y_test.reshape(-1, 1)))
-    r2_rf = r2_score( y_test_orig, y_pred_orig)
-    mse_rf = mean_squared_error(y_pred_orig, y_test_orig)
-    std_rf = np.std(y_pred_orig- y_test_orig)
+# Step 2: Define features and labels
+muonFeatures = ['inX', 'inZ', 'outX', 'outZ', 'dInX','dInZ','dOutX','dOutZ']
+muonLabel = ['objectX', 'objectZ']
 
-    print("\n#### Random Forest Model: #####")
-    print(f"R^2 Score: {r2_rf}")
-    print(f"Mean Squared Error: {mse_rf} MeV²")
-    print(f"Standard Deviation of Residuals: {std_rf} MeV")
-    plt.hist(y_pred_orig-y_test_orig, bins=200, alpha=0.7, color='orange')
-    plt.show()
+# Drop NaNs or infinite values (optional but recommended)
+test_df = test_df.replace([np.inf, -np.inf], np.nan).dropna(subset=muonFeatures + muonLabel + ['angleDev'])
 
-def polyLog():
-    y_log = np.log1p(filtered_data['g4Momentum'])  # log(1 + x) for safety
+# Step 3: Prepare test features
+X_test = test_df[muonFeatures].values
+angleDev = test_df['angleDev'].values
 
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y_log.values.reshape(-1, 1))  # y or y_log can be changed here
+# Optional: Normalize if you trained with normalized features
+# If you used StandardScaler in training, reload and apply the same scaler here
+# scaler = joblib.load("scaler.joblib")
+# X_test = scaler.transform(X_test)
 
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
-    )
-    poly = PolynomialFeatures(degree=5)
-    X_train_poly = poly.fit_transform(X_train)
-    X_test_poly = poly.transform(X_test)
-    poly_model = LinearRegression()
-    poly_model.fit(X_train_poly, y_train)
-    y_pred_poly_scaled = poly_model.predict(X_test_poly)
-    y_pred_poly_orig = scaler_y.inverse_transform(y_pred_poly_scaled)
-    y_pred_orig = np.expm1(y_pred_poly_orig)
-    y_test_orig = np.expm1(scaler_y.inverse_transform(y_test.reshape(-1, 1)))
-    r2_pf = r2_score( y_test_orig, y_pred_orig)
-    mse_pf = mean_squared_error(y_pred_orig, y_test_orig)
-    std_pf = np.std(y_pred_orig- y_test_orig)
-    print("\n#### Polynomial Features Log Model: #####")
-    print(f"R^2 Score: {r2_pf}")
-    print(f"Mean Squared Error: {mse_pf} MeV²")
-    print(f"Standard Deviation of Residuals: {std_pf} MeV")
-    plt.hist(y_pred_orig-y_test_orig, bins=200, alpha=0.7, color='orange')
-    plt.show()
+# Step 4: Load trained model
+model = joblib.load("xgb_model.joblib")
 
-def polyNatLog():
-    y_log = np.log(filtered_data['g4Momentum'])  # log(1 + x) for safety
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y_log.values.reshape(-1, 1))  # y or y_log can be changed here
+# Step 5: Predict objectX and objectZ
+y_pred = model.predict(X_test)
+predX = y_pred[:, 0]
+predZ = y_pred[:, 1]
 
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
-    )
-    poly = PolynomialFeatures(degree=7, include_bias=False)
-    X_train_poly = poly.fit_transform(X_train)
-    X_test_poly = poly.transform(X_test)
-    poly_model = LinearRegression()
-    poly_model.fit(X_train_poly, y_train)
-    y_pred_poly_scaled = poly_model.predict(X_test_poly)
-    y_pred_poly_orig = scaler_y.inverse_transform(y_pred_poly_scaled)
-    y_pred_orig = np.exp(y_pred_poly_orig)
-    y_test_orig = np.exp(scaler_y.inverse_transform(y_test.reshape(-1, 1)))
-    r2_pf = r2_score( y_test_orig, y_pred_orig)
-    mse_pf = mean_squared_error(y_pred_orig, y_test_orig)
-    std_pf = np.std(y_pred_orig- y_test_orig)
-    print("\n#### Polynomial Features Nat Log Model: #####")
-    print(f"R^2 Score: {r2_pf}")
-    print(f"Mean Squared Error: {mse_pf} MeV²")
-    print(f"Standard Deviation of Residuals: {std_pf} MeV")
-    plt.hist(y_pred_orig-y_test_orig, bins=200, alpha=0.7, color='orange')
-    plt.show()
+# Step 6: Plot hexbin with std(angleDev) as color
+plt.figure(figsize=(10, 8))
+hb = plt.hexbin(predX, predZ, C=angleDev, gridsize=100, reduce_C_function=np.std, cmap='inferno_r')
+plt.colorbar(hb, label='Std Dev of angleDev')
+plt.xlabel('Predicted objectX')
+plt.ylabel('Predicted objectZ')
+plt.title('Hexbin Plot of Predicted (objectX, objectZ) with angleDev Std Dev')
+plt.tight_layout()
+plt.show()
 
+print("Evaluating Performance")
+from scipy.stats import binned_statistic_2d
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
-def polyInv():
-    y_Inv = 1 / np.log(filtered_data['g4Momentum'])
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    #y_scaled = y_Inv
-    y_scaled = scaler_y.fit_transform(y_Inv.values.reshape(-1, 1))  # y or y_log can be changed here
+trueX = test_df['objectX'].values
+trueZ = test_df['objectZ'].values
+pocaX = test_df['pX'].values
+pocaZ = test_df['pZ'].values
 
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
-    )
-    poly = PolynomialFeatures(degree=5)
-    X_train_poly = poly.fit_transform(X_train)
-    X_test_poly = poly.transform(X_test)
-    poly_model = LinearRegression()
-    poly_model.fit(X_train_poly, y_train)
-    y_pred_poly_scaled = poly_model.predict(X_test_poly)
-    y_pred_poly_orig = scaler_y.inverse_transform(y_pred_poly_scaled)
-    y_pred_orig = np.exp(1 / y_pred_poly_orig)
-    y_test_orig = np.exp(1 / (scaler_y.inverse_transform(y_test.reshape(-1, 1))))
-    #y_test_orig = np.exp(1 / (scaler_y.inverse_transform(y_test.reshape(-1, 1)))) - 1 - 0.001
-    r2_pf = r2_score( y_test_orig, y_pred_orig)
-    mse_pf = mean_squared_error(y_pred_orig, y_test_orig)
-    std_pf = np.std(y_pred_orig- y_test_orig)
-    print("\n#### Polynomial Features Inverse Model: #####")
-    print(f"R^2 Score: {r2_pf}")
-    print(f"Mean Squared Error: {mse_pf} MeV²")
-    print(f"Standard Deviation of Residuals: {std_pf} MeV")
-    plt.hist(y_pred_orig-y_test_orig, bins=200, alpha=0.7, color='orange')
-    plt.show()
+# Define image space grid
+bins = 100
+x_edges = np.linspace(-500, 500, bins)
+z_edges = np.linspace(-500, 500, bins)
 
-def xgbLog():
-    import xgboost as xgb
-    y_log = np.log(filtered_data['g4Momentum'])  # log(1 + x) for safety
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y_log.values.reshape(-1, 1))  # y or y_log can be changed here
+# Function to create 2D histograms/images from point cloud
+def make_image(x, z, values):
+    stat, _, _, _ = binned_statistic_2d(x, z, values, statistic='std', bins=[x_edges, z_edges])
+    stat = np.nan_to_num(stat)  # replace NaNs with 0
+    return stat
 
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42, shuffle=True
-    )
-    model = xgb.XGBRegressor()
-    model.fit(X_train, y_train)
-    # Predict
-    y_pred_xgb_scaled = model.predict(X_test)
-    y_pred_xgb_orig = scaler_y.inverse_transform(y_pred_xgb_scaled.reshape(-1, 1))
-    y_pred_orig = np.exp(y_pred_xgb_orig)
-    y_test_orig = np.exp((scaler_y.inverse_transform(y_test.reshape(-1, 1))))
-    r2_pf = r2_score(y_test_orig, y_pred_orig)
-    mse_pf = mean_squared_error(y_pred_orig, y_test_orig)
-    std_pf = np.std(y_pred_orig - y_test_orig)
-    print("\n#### XGB Log Model: #####")
-    print(f"R^2 Score: {r2_pf}")
-    print(f"Mean Squared Error: {mse_pf} MeV²")
-    print(f"Standard Deviation of Residuals: {std_pf} MeV")
-    plt.hist(y_pred_orig - y_test_orig, bins=200, alpha=0.7, color='orange')
-    plt.show()
+# Build image grids
+img_pred = make_image(predX, predZ, angleDev)
+img_true = make_image(trueX, trueZ, angleDev)
+img_poca = make_image(pocaX, pocaZ, angleDev)
+
+# SSIM & PSNR between predicted and true
+ssim_pred_true = ssim(img_true, img_pred, data_range=img_true.max() - img_true.min())
+psnr_pred_true = psnr(img_true, img_pred, data_range=img_true.max() - img_true.min())
+
+# SSIM & PSNR between poca and true
+ssim_poca_true = ssim(img_true, img_poca, data_range=img_true.max() - img_true.min())
+psnr_poca_true = psnr(img_true, img_poca, data_range=img_true.max() - img_true.min())
+
+# Print metrics
+print("\n🧠 Image Similarity Metrics (angleDev-weighted heatmaps):")
+print(f"SSIM (Predicted vs True): {ssim_pred_true:.4f}")
+print(f"PSNR (Predicted vs True): {psnr_pred_true:.2f} dB")
+print(f"SSIM (PoCA vs True):      {ssim_poca_true:.4f}")
+print(f"PSNR (PoCA vs True):      {psnr_poca_true:.2f} dB")
+
+# Optional: Show images
+titles = ['True', 'Predicted', 'PoCA']
+images = [img_true, img_pred, img_poca]
+
+plt.figure(figsize=(18, 5))
+for i in range(3):
+    plt.subplot(1, 3, i + 1)
+    plt.imshow(images[i], extent=[-500, 500, -500, 500], origin='lower', cmap='inferno')
+    plt.title(f"{titles[i]} Heatmap")
+    plt.xlabel("objectX")
+    plt.ylabel("objectZ")
+    plt.colorbar(label="Mean angleDev")
+plt.tight_layout()
+plt.show()
 
 
-if __name__=="__main__":
-    rfLog()     #Random Forest Log Output
-    polyLog()   # Polynomial Log Output
-    polyNatLog() # Polynomial Nat Log Output
-    polyInv()   #Polynomial inverse Log
-    xgbLog()    #xgBoost Log
