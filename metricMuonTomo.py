@@ -1,127 +1,233 @@
 import uproot
 import pandas as pd
 import numpy as np
+import joblib
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+
+
+# Step 1: Load test data from ROOT
+imgFile = uproot.open("Event1e7_3Fe_2U.root")
+imgTree = imgFile['groundTruthPoCA']
+imgDF = imgTree.arrays(library='np')
+
+# Rename 'pocaX', 'pocaY', 'pocaZ' to 'objectX', etc.
+for i in ('X', 'Y', 'Z'):
+    imgDF['object' + i] = imgDF['poca' + i]
+    del imgDF['poca' + i]
+
+# Convert to DataFrame
+test_df = pd.DataFrame(imgDF)
+#test_df = test_df[test_df['angleDev']>30e-3]
+
+# Step 2: Define features and labels
+muonFeatures = ['inX', 'inZ', 'outX', 'outZ', 'dInX','dInZ','dOutX','dOutZ']
+muonLabel = ['objectX', 'objectZ']
+
+# Drop NaNs or infinite values (optional but recommended)
+test_df = test_df.replace([np.inf, -np.inf], np.nan).dropna(subset=muonFeatures + muonLabel + ['angleDev'])
+#test_df = test_df.sample(n=10**5, random_state=42)
+# Step 3: Prepare test features
+X_test = test_df[muonFeatures].values
+angleDev = test_df['angleDev'].values
+
+# Optional: Normalize if you trained with normalized features
+# If you used StandardScaler in training, reload and apply the same scaler here
+# scaler = joblib.load("scaler.joblib")
+# X_test = scaler.transform(X_test)
+
+# Step 4: Load trained model
+model = joblib.load("xgb_model.joblib")
+
+# Step 5: Predict objectX and objectZ
+y_pred = model.predict(X_test)
+predX = y_pred[:, 0]
+predZ = y_pred[:, 1]
+
+# Step 6: Plot hexbin with std(angleDev) as color
+plt.figure(figsize=(10, 8))
+hb = plt.hexbin(predX, predZ, C=angleDev, gridsize=50, reduce_C_function=np.std, cmap='inferno_r')
+plt.colorbar(hb, label='Std Dev of angleDev')
+plt.xlabel('Predicted objectX')
+plt.ylabel('Predicted objectZ')
+plt.title('Hexbin Plot of Predicted (objectX, objectZ) with angleDev Std Dev')
+plt.tight_layout()
+plt.show()
+
+print("Evaluating Performance")
+from scipy.stats import binned_statistic_2d
 from skimage.metrics import structural_similarity as ssim
-from sklearn.metrics import mean_squared_error
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
-#plt.style.use(['science', 'ieee', 'no-latex'])
+trueX = test_df['objectX'].values
+trueZ = test_df['objectZ'].values
+pocaX = test_df['pX'].values
+pocaZ = test_df['pZ'].values
 
+# Define image space grid
+bins = 200
+x_edges = np.linspace(-500, 500, bins)
+z_edges = np.linspace(-500, 500, bins)
 
-# Define Gaussian function for FWHM
-def gaussian(x, A, mu, sigma):
-    return A * np.exp(-(x - mu) ** 2 / (2 * sigma ** 2))
+# Function to create 2D histograms/images from point cloud
+def make_image(x, z, values):
+    stat, _, _, _ = binned_statistic_2d(x, z, values, statistic='std', bins=[x_edges, z_edges])
+    stat = np.nan_to_num(stat)  # replace NaNs with 0
+    return stat
 
-# Modified FWHM computation to handle NaNs
-def compute_fwhm(hist, bins, axis=0):
-    # Find peak in histogram, ignoring NaNs
-    hist_clean = np.where(np.isnan(hist), 0, hist)  # Replace NaNs with 0 for peak finding
-    peak_idx = np.argmax(hist_clean)
-    peak_x, peak_y = np.unravel_index(peak_idx, hist.shape)
+'''
+# Function to create 2D histograms/images from point cloud with thresholding
+def make_image_with_threshold(x, z, values, x_edges, z_edges, percentile=10):
+    stat, _, _, _ = binned_statistic_2d(x, z, values, statistic='std', bins=[x_edges, z_edges])
+    stat = np.nan_to_num(stat, nan=0.0)  # temporarily replace NaNs with 0 for percentile calc
+    threshold = np.percentile(stat[stat > 0], percentile)  # ignore 0s to compute percentile
+    stat_masked = np.where(stat < threshold, 0, stat)  # mask values below threshold
+    return stat_masked
+'''
+def make_image_with_threshold(x, z, values, x_edges, z_edges, percentile=25):
+    # Compute std of angleDev in each bin
+    std_stat, _, _, _ = binned_statistic_2d(x, z, values, statistic='std', bins=[x_edges, z_edges])
+    std_stat = np.nan_to_num(std_stat, nan=0.0)
 
-    # Extract profile along specified axis
-    if axis == 0:  # X-axis
-        profile = hist[:, peak_y]
-        x_vals = (bins[:-1] + bins[1:]) / 2
-    else:  # Z-axis
-        profile = hist[peak_x, :]
-        x_vals = (bins[:-1] + bins[1:]) / 2
+    # Compute count in each bin
+    count_stat, _, _, _ = binned_statistic_2d(x, z, values, statistic='count', bins=[x_edges, z_edges])
+    count_stat = np.nan_to_num(count_stat, nan=0.0)
 
-    # Remove NaNs from profile and corresponding x_vals
-    valid = ~np.isnan(profile)
-    profile_clean = profile[valid]
-    x_vals_clean = x_vals[valid]
-
-    # Check if profile has enough valid points for fitting
-    if len(profile_clean) < 4 or np.all(profile_clean == 0):
-        return np.nan  # Return NaN if insufficient data
-
-    # Fit Gaussian
-    try:
-        popt, _ = curve_fit(gaussian, x_vals_clean, profile_clean,
-                            p0=[np.max(profile_clean), x_vals_clean[np.argmax(profile_clean)], 10],
-                            bounds=([0, np.min(x_vals_clean), 0], [np.inf, np.max(x_vals_clean), np.inf]))
-        fwhm = 2.355 * abs(popt[2])  # FWHM = 2.355 * sigma
-    except (RuntimeError, ValueError):
-        fwhm = np.nan
-    return fwhm
-
-
-
-# Load ROOT files
-test_file = uproot.open("testMay.root")
-processed_file = uproot.open("image_testMay.root")
-
-test_tTree = test_file["groundTruthPoCA"]
-processed_tTree = processed_file["tree"]
-
-# Convert TTrees to DataFrames
-test_df = pd.DataFrame(test_tTree.arrays(library="pd")).dropna()
-processed_df = pd.DataFrame(processed_tTree.arrays(library="pd")).dropna()
-
-# Filter data (same as your code for consistency)
-test_df = test_df[(test_df['angleDev'] > 30e-3)]
-processed_df = processed_df[(processed_df['angleDev'] > 30e-3)]
-
-# Extract coordinates and angleDev
-x_test, z_test, angle_test = test_df['pocaX'], test_df['pocaZ'], test_df['angleDev']
-x_proc, z_proc, angle_proc = processed_df['pX'], processed_df['pZ'], processed_df['angleDev']
-
-# Histogram parameters
-bins = 100
-x_bins = np.linspace(-500, 500, bins + 1)
-z_bins = np.linspace(-500, 500, bins + 1)
+    # Thresholds
+    std_thresh = np.percentile(std_stat[std_stat > 0], percentile)
+    count_thresh = np.percentile(count_stat[count_stat > 0], percentile)
+    # Apply combined mask
+    mask = (std_stat >= std_thresh) & (count_stat >= count_thresh)
+    masked_image = np.where(mask, std_stat, 0)
+    return masked_image
 
 
-# Compute histograms for standard deviation
-def compute_std_histogram(x, z, angle_dev, x_bins, z_bins):
-    counts, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
-    sum_weights, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev)
-    sum_weights_squared, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev ** 2)
-    valid = counts > 0
-    mean = np.zeros_like(counts, dtype=float)
-    mean[valid] = sum_weights[valid] / counts[valid]
-    mean_squared = np.zeros_like(counts, dtype=float)
-    mean_squared[valid] = sum_weights_squared[valid] / counts[valid]
-    std = np.sqrt(np.abs(mean_squared - mean ** 2))
-    std[~valid] = np.nan
-    return std
+
+# Build image grids
+img_pred = make_image_with_threshold(predX, predZ, angleDev,x_edges, z_edges)
+img_true = make_image(trueX, trueZ, angleDev)
+img_poca = make_image_with_threshold(pocaX, pocaZ, angleDev,x_edges, z_edges)
+
+# SSIM & PSNR between predicted and true
+ssim_pred_true = ssim(img_true, img_pred, data_range=img_true.max() - img_true.min())
+psnr_pred_true = psnr(img_true, img_pred, data_range=img_true.max() - img_true.min())
+
+# SSIM & PSNR between poca and true
+ssim_poca_true = ssim(img_true, img_poca, data_range=img_true.max() - img_true.min())
+psnr_poca_true = psnr(img_true, img_poca, data_range=img_true.max() - img_true.min())
+
+# Print metrics
+print("\n🧠 Image Similarity Metrics (angleDev-weighted heatmaps):")
+print(f"SSIM (Predicted vs True): {ssim_pred_true:.4f}")
+print(f"PSNR (Predicted vs True): {psnr_pred_true:.2f} dB")
+print(f"SSIM (PoCA vs True):      {ssim_poca_true:.4f}")
+print(f"PSNR (PoCA vs True):      {psnr_poca_true:.2f} dB")
+
+# Optional: Show images
+titles = ['True', 'Predicted', 'PoCA']
+images = [img_true, img_pred, img_poca]
+
+plt.figure(figsize=(18, 5))
+for i in range(3):
+    plt.subplot(1, 3, i + 1)
+    plt.imshow(images[i], extent=[-500, 500, -500, 500], origin='lower', cmap='inferno_r')
+    plt.title(f"{titles[i]} Heatmap")
+    plt.xlabel("objectX")
+    plt.ylabel("objectZ")
+    plt.colorbar(label="Std. Deviation angleDev")
+plt.tight_layout()
+plt.show()
 
 
-# Compute histograms for standard deviation
-def compute_std_histogramProc(x, z, angle_dev, x_bins, z_bins):
-    counts, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
-    sum_weights, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev)
-    sum_weights_squared, _, _ = np.histogram2d(x, z, bins=[x_bins, z_bins], weights=angle_dev ** 2)
-    valid = counts > 100
-    mean = np.zeros_like(counts, dtype=float)
-    mean[valid] = sum_weights[valid] / counts[valid]
-    mean_squared = np.zeros_like(counts, dtype=float)
-    mean_squared[valid] = sum_weights_squared[valid] / counts[valid]
-    std = np.sqrt(np.abs(mean_squared - mean ** 2))
-    std[~valid] = np.nan
-    return std
 
 
-std_test = compute_std_histogram(x_test, z_test, angle_test, x_bins, z_bins)
-std_proc = compute_std_histogramProc(x_proc, z_proc, angle_proc, x_bins, z_bins)
+'''
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from scipy.ndimage import center_of_mass
+from scipy.stats import entropy
+from scipy.interpolate import interp1d
+import warnings
+warnings.filterwarnings("ignore")  # Suppress SSIM/PSNR divide-by-zero for empty masks
 
-# Apply mask (std > 0.01)
-threshold = np.nanmedian(std_test) * 0.6
-mask_test = (std_test > threshold)
-mask_proc =  (std_proc > threshold)
-#mask = (std_test > 0.01) & (std_proc > 0.01)
-std_test_masked = np.where(mask_test, std_test, np.nan)
-std_proc_masked = np.where(mask_proc, std_proc, np.nan)
-std_test_maskedN = np.where(~mask_test, std_test, np.nan)
-std_proc_maskedN = np.where(~mask_proc, std_proc, np.nan)
+# Flatten all images
+flat_true = img_true.flatten()
+flat_pred = img_pred.flatten()
+flat_poca = img_poca.flatten()
 
-# Metric 1: Spatial Resolution (FWHM)
-fwhm_x_test = compute_fwhm(std_test_masked, x_bins, axis=0)
-fwhm_z_test = compute_fwhm(std_test_masked, z_bins, axis=1)
-fwhm_x_proc = compute_fwhm(std_proc_masked, x_bins, axis=0)
-fwhm_z_proc = compute_fwhm(std_proc_masked, z_bins, axis=1)
+mse_pred = mean_squared_error(flat_true, flat_pred)
+rmse_pred = np.sqrt(mse_pred)
+mae_pred = mean_absolute_error(flat_true, flat_pred)
+
+mse_poca = mean_squared_error(flat_true, flat_poca)
+rmse_poca = np.sqrt(mse_poca)
+mae_poca = mean_absolute_error(flat_true, flat_poca)
+def normalized_cross_correlation(img1, img2):
+    img1_mean = img1 - np.mean(img1)
+    img2_mean = img2 - np.mean(img2)
+    numerator = np.sum(img1_mean * img2_mean)
+    denominator = np.sqrt(np.sum(img1_mean**2) * np.sum(img2_mean**2))
+    return numerator / denominator if denominator != 0 else 0.0
+
+ncc_pred = normalized_cross_correlation(img_true, img_pred)
+ncc_poca = normalized_cross_correlation(img_true, img_poca)
+com_true = center_of_mass(img_true)
+com_pred = center_of_mass(img_pred)
+com_poca = center_of_mass(img_poca)
+
+def dist(a, b):
+    return np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+com_shift_pred = dist(com_true, com_pred)
+com_shift_poca = dist(com_true, com_poca)
+def compute_fwhm(profile, x_axis):
+    max_val = np.max(profile)
+    half_max = max_val / 2.0
+    interp_func = interp1d(x_axis, profile - half_max, kind='linear', bounds_error=False, fill_value='extrapolate')
+    zero_crossings = np.where(np.diff(np.sign(profile - half_max)))[0]
+    if len(zero_crossings) >= 2:
+        x1 = x_axis[zero_crossings[0]]
+        x2 = x_axis[zero_crossings[-1]]
+        return abs(x2 - x1)
+    return np.nan
+
+center_row = img_true.shape[1] // 2
+x_axis = np.linspace(-500, 500, img_true.shape[0])
+
+fwhm_true = compute_fwhm(img_true[:, center_row], x_axis)
+fwhm_pred = compute_fwhm(img_pred[:, center_row], x_axis)
+fwhm_poca = compute_fwhm(img_poca[:, center_row], x_axis)
+def image_entropy(img):
+    hist, _ = np.histogram(img, bins=100, range=(img.min(), img.max()), density=True)
+    hist = hist[hist > 0]  # Remove zero bins
+    return entropy(hist)
+
+entropy_true = image_entropy(img_true)
+entropy_pred = image_entropy(img_pred)
+entropy_poca = image_entropy(img_poca)
+print("\n📈 Extended Evaluation Metrics:")
+print(f"RMSE (Predicted vs True): {rmse_pred:.4f}")
+print(f"MAE  (Predicted vs True): {mae_pred:.4f}")
+print(f"NCC  (Predicted vs True): {ncc_pred:.4f}")
+print(f"COM Shift (Predicted):    {com_shift_pred:.2f} px")
+print(f"FWHM (Predicted):         {fwhm_pred:.2f} units")
+print(f"Entropy (Predicted):      {entropy_pred:.4f}")
+
+print(f"\nRMSE (PoCA vs True):      {rmse_poca:.4f}")
+print(f"MAE  (PoCA vs True):      {mae_poca:.4f}")
+print(f"NCC  (PoCA vs True):      {ncc_poca:.4f}")
+print(f"COM Shift (PoCA):         {com_shift_poca:.2f} px")
+print(f"FWHM (PoCA):              {fwhm_poca:.2f} units")
+print(f"Entropy (PoCA):           {entropy_poca:.4f}")
+
+print(f"\nFWHM (True):              {fwhm_true:.2f} units")
+print(f"Entropy (True):           {entropy_true:.4f}")
+
+
+# Define masks for ROI (non-zero values) and background
+threshold = np.percentile(img_true[img_true > 0], 50)
+mask_true = img_true > threshold  # ROI where histogram has non-zero values
+mask_pred = img_pred > threshold
+mask_poca = img_poca > threshold
+
 
 # Metric 2: Contrast
 def compute_contrast(hist, mask):
@@ -131,11 +237,6 @@ def compute_contrast(hist, mask):
         return np.mean(roi) / np.mean(background)
     return np.nan
 
-
-
-contrast_test = compute_contrast(std_test, mask_test)
-contrast_proc = compute_contrast(std_proc, mask_proc)
-
 # Metric 3: Uniformity
 def compute_uniformity(hist, mask):
     background = hist[~mask & ~np.isnan(hist)]
@@ -143,54 +244,46 @@ def compute_uniformity(hist, mask):
         return np.std(background) / np.mean(background)
     return np.nan
 
+# Compute metrics for True, Predicted, and PoCA images
+contrast_true = compute_contrast(img_true, mask_true)
+contrast_pred = compute_contrast(img_pred, mask_pred)
+contrast_poca = compute_contrast(img_poca, mask_poca)
 
-uniformity_test = compute_uniformity(std_test, mask_test)
-uniformity_proc = compute_uniformity(std_proc, mask_proc)
+uniformity_true = compute_uniformity(img_true, mask_true)
+uniformity_pred = compute_uniformity(img_pred, mask_pred)
+uniformity_poca = compute_uniformity(img_poca, mask_poca)
 
-# Metric 4: SSIM
-# Normalize histograms to avoid SSIM issues with NaNs
-std_test_norm = np.where(np.isnan(std_test), 0, std_test)
-std_proc_norm = np.where(np.isnan(std_proc), 0, std_proc)
-ssim_value, _ = ssim(std_test_norm, std_proc_norm, data_range=np.max(std_test_norm) - np.min(std_test_norm), full=True)
-
-# Metric 5: MSE
-valid_pixels = ~np.isnan(std_test) & ~np.isnan(std_proc)
-mse_value = mean_squared_error(std_test[valid_pixels], std_proc[valid_pixels])
-
-# Print results
-print(f"Metrics Comparison:")
-print(f"Spatial Resolution (FWHM X): Original = {fwhm_x_test:.2f}, Processed = {fwhm_x_proc:.2f}")
-print(f"Spatial Resolution (FWHM Z): Original = {fwhm_z_test:.2f}, Processed = {fwhm_z_proc:.2f}")
-print(f"Contrast: Original = {contrast_test:.2f}, Processed = {contrast_proc:.2f}")
-print(f"Uniformity: Original = {uniformity_test:.2f}, Processed = {uniformity_proc:.2f}")
-print(f"SSIM: {ssim_value:.2f}")
-print(f"MSE: {mse_value:.6f}")
+# Print contrast and uniformity metrics
+print("\n🧠 Contrast and Uniformity Metrics:")
+print(f"Contrast (True):     {contrast_true:.4f}")
+print(f"Contrast (Predicted): {contrast_pred:.4f}")
+print(f"Contrast (PoCA):     {contrast_poca:.4f}")
+print(f"Uniformity (True):   {uniformity_true:.4f}")
+print(f"Uniformity (Predicted): {uniformity_pred:.4f}")
+print(f"Uniformity (PoCA):   {uniformity_poca:.4f}")
+'''
 
 
-def compute_psnr(ref, img):
-    mse = np.nanmean((ref - img) ** 2)
-    if mse == 0:
-        return np.inf
-    max_pixel = np.nanmax(ref)
-    return 20 * np.log10(max_pixel / np.sqrt(mse))
 
-psnr_value = compute_psnr(std_test, std_proc)
-print(f"PSNR: {psnr_value:.2f} dB")
+import torch
+import piq
+# Convert images to PyTorch tensors
+img_pred_tensor = torch.tensor(img_pred, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+img_true_tensor = torch.tensor(img_true, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+img_poca_tensor = torch.tensor(img_poca, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
+# Normalize tensors to [0, 1] (important for MS-SSIM)
+def normalize_tensor(img):
+    img_min = img.min()
+    img_max = img.max()
+    return (img - img_min) / (img_max - img_min + 1e-8)
 
-# Visualize both images
-plt.figure(figsize=(10, 4))
-plt.subplot(1, 2, 1)
-plt.imshow(std_test_masked.T, origin='lower', extent=[-500, 500, -500, 500], cmap='inferno_r')
-plt.title('Original Image (Std of angleDev)')
-plt.xlabel('X')
-plt.ylabel('Z')
-plt.colorbar(label='Std. of Scattering Angle')
-plt.subplot(1, 2, 2)
-plt.imshow(std_proc_masked.T, origin='lower', extent=[-500, 500, -500, 500], cmap='inferno_r')
-plt.title('Processed Image (Std of angleDev)')
-plt.xlabel('X')
-plt.ylabel('Z')
-plt.colorbar(label='Std. of Scattering Angle')
-plt.tight_layout()
-plt.show()
+img_pred_tensor = normalize_tensor(img_pred_tensor)
+img_true_tensor = normalize_tensor(img_true_tensor)
+img_poca_tensor = normalize_tensor(img_poca_tensor)
+
+# Compute MS-SSIM
+msssim_pred_true = piq.multi_scale_ssim(img_pred_tensor, img_true_tensor, data_range=1.0).item()
+msssim_poca_true = piq.multi_scale_ssim(img_poca_tensor, img_true_tensor, data_range=1.0).item()
+print(f"MS-SSIM (Predicted vs True): {msssim_pred_true:.4f}")
+print(f"MS-SSIM (PoCA vs True):      {msssim_poca_true:.4f}")
